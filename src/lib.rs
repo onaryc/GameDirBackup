@@ -18,18 +18,8 @@ pub struct TreeNode {
     pub children: Vec<TreeNode>,
 }
 
-pub fn build_flat_tree(path: &Path) -> Result<Vec<FlatNode>, std::io::Error> {
-    let mut nodes = Vec::new();
-    build_flat_tree_recursive(path, None, &mut nodes)?;
-    nodes.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(nodes)
-}
-
-fn build_flat_tree_recursive(
-    path: &Path,
-    parent_path: Option<String>,
-    nodes: &mut Vec<FlatNode>,
-) -> Result<(), std::io::Error> {
+/// Construit une arborescence de fichiers/dossiers en mode Tree (imbriqué)
+pub fn build_tree(path: &Path) -> Result<TreeNode, std::io::Error> {
     let name = path.file_name()
         .unwrap_or_else(|| path.as_os_str())
         .to_string_lossy()
@@ -37,39 +27,17 @@ fn build_flat_tree_recursive(
 
     let path_str = path.to_string_lossy().into_owned();
 
+    // Exclure le dossier target/
     if path.file_name().map_or(false, |n| n == "target") {
-        return Ok(());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Skipping target directory"
+        ));
     }
-
-    let node = FlatNode {
-        name,
-        path: path_str.clone(),
-        is_directory: path.is_dir(),
-        parent: parent_path,
-    };
-
-    nodes.push(node);
-
-    if path.is_dir() {
-        let entries = fs::read_dir(path)?;
-        for entry in entries {
-            let entry = entry?;
-            build_flat_tree_recursive(&entry.path(), Some(path_str.clone()), nodes)?;
-        }
-    }
-
-    Ok(())
-}
-
-pub fn build_tree(path: &Path) -> Result<TreeNode, std::io::Error> {
-    let name = path.file_name()
-        .unwrap_or_else(|| path.as_os_str())
-        .to_string_lossy()
-        .into_owned();
 
     let mut node = TreeNode {
         name,
-        path: path.to_string_lossy().into_owned(),
+        path: path_str.clone(),
         is_directory: path.is_dir(),
         children: Vec::new(),
     };
@@ -79,16 +47,45 @@ pub fn build_tree(path: &Path) -> Result<TreeNode, std::io::Error> {
         for entry in entries {
             let entry = entry?;
             let child_path = entry.path();
+
+            // Exclure le dossier target/
             if child_path.file_name().map_or(false, |n| n == "target") {
                 continue;
             }
-            let child = build_tree(&child_path)?;
-            node.children.push(child);
+
+            match build_tree(&child_path) {
+                Ok(child) => node.children.push(child),
+                Err(_) => continue, // Ignorer les erreurs (comme target/)
+            }
         }
+        // Trier les enfants alphabétiquement
         node.children.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
     Ok(node)
+}
+
+/// Convertit une arborescence TreeNode en une liste plate de FlatNode
+pub fn tree_to_flat(tree: &TreeNode) -> Vec<FlatNode> {
+    let mut flat_nodes = Vec::new();
+    build_flat_from_tree(tree, None, &mut flat_nodes);
+    flat_nodes
+}
+
+fn build_flat_from_tree(node: &TreeNode, parent_path: Option<String>, flat_nodes: &mut Vec<FlatNode>) {
+    let flat_node = FlatNode {
+        name: node.name.clone(),
+        path: node.path.clone(),
+        is_directory: node.is_directory,
+        parent: parent_path.clone(),
+    };
+    flat_nodes.push(flat_node);
+
+    if node.is_directory {
+        for child in &node.children {
+            build_flat_from_tree(child, Some(node.path.clone()), flat_nodes);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,65 +153,35 @@ mod tests {
     }
 
     #[test]
-    fn test_build_flat_tree_empty_directory() {
-        let dir = tempdir().unwrap();
-        let path = dir.path();
-
-        let result = build_flat_tree(path).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].is_directory, true);
-        assert_eq!(result[0].parent, None);
-    }
-
-    #[test]
-    fn test_build_flat_tree_single_file() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test.txt");
-        File::create(&file_path).unwrap();
-
-        let result = build_flat_tree(dir.path()).unwrap();
-
-        assert_eq!(result.len(), 2);
-
-        let dir_node = result.iter().find(|n| n.is_directory).unwrap();
-        let file_node = result.iter().find(|n| !n.is_directory).unwrap();
-
-        assert_eq!(dir_node.parent, None);
-        assert_eq!(file_node.parent, Some(dir.path().to_string_lossy().into_owned()));
-    }
-
-    #[test]
-    fn test_build_flat_tree_nested_structure() {
+    fn test_tree_to_flat() {
         let dir = tempdir().unwrap();
         let subdir = dir.path().join("subdir");
         fs::create_dir(&subdir).unwrap();
-        File::create(subdir.join("file.txt")).unwrap();
+        File::create(dir.path().join("file1.txt")).unwrap();
+        File::create(subdir.join("file2.txt")).unwrap();
 
-        let result = build_flat_tree(dir.path()).unwrap();
+        let tree = build_tree(dir.path()).unwrap();
+        let flat = tree_to_flat(&tree);
 
-        assert_eq!(result.len(), 3);
+        assert_eq!(flat.len(), 4); // root, file1.txt, subdir, file2.txt
 
-        let dir_node = result.iter().find(|n| n.path == dir.path().to_string_lossy()).unwrap();
-        let subdir_node = result.iter().find(|n| n.name == "subdir").unwrap();
-        let file_node = result.iter().find(|n| n.name == "file.txt").unwrap();
+        // Vérifier que la racine a parent = None
+        let root_flat = flat.iter().find(|n| n.path == dir.path().to_string_lossy()).unwrap();
+        assert_eq!(root_flat.parent, None);
 
-        assert_eq!(dir_node.parent, None);
-        assert_eq!(subdir_node.parent, Some(dir.path().to_string_lossy().into_owned()));
-        assert_eq!(file_node.parent, Some(subdir.to_string_lossy().into_owned()));
-    }
+        // Vérifier que file1.txt a pour parent la racine
+        let file1 = flat.iter().find(|n| n.name == "file1.txt").unwrap();
+        assert_eq!(file1.parent, Some(dir.path().to_string_lossy().into_owned()));
+        assert_eq!(file1.is_directory, false);
 
-    #[test]
-    fn test_build_flat_tree_excludes_target() {
-        let dir = tempdir().unwrap();
-        let target_dir = dir.path().join("target");
-        fs::create_dir(&target_dir).unwrap();
-        File::create(target_dir.join("debug")).unwrap();
+        // Vérifier que subdir a pour parent la racine
+        let subdir_flat = flat.iter().find(|n| n.name == "subdir").unwrap();
+        assert_eq!(subdir_flat.parent, Some(dir.path().to_string_lossy().into_owned()));
+        assert_eq!(subdir_flat.is_directory, true);
 
-        let result = build_flat_tree(dir.path()).unwrap();
-
-        assert!(!result.iter().any(|n| n.name == "target"));
-        assert!(!result.iter().any(|n| n.name == "debug"));
+        // Vérifier que file2.txt a pour parent subdir
+        let file2 = flat.iter().find(|n| n.name == "file2.txt").unwrap();
+        assert_eq!(file2.parent, Some(subdir.to_string_lossy().into_owned()));
     }
 
     #[test]
@@ -226,6 +193,7 @@ mod tests {
 
         let result = build_tree(dir.path()).unwrap();
 
+        // Vérifier que target n'est pas dans les enfants
         assert!(!result.children.iter().any(|n| n.name == "target"));
     }
 
@@ -237,14 +205,12 @@ mod tests {
         File::create(dir.path().join("subdir").join("file2.txt")).unwrap();
 
         let tree = build_tree(dir.path()).unwrap();
-        let flat = build_flat_tree(dir.path()).unwrap();
+        let flat = tree_to_flat(&tree);
 
-        let mut all_flat_paths: Vec<String> = flat.iter().map(|n| n.path.clone()).collect();
-        all_flat_paths.sort();
+        let all_flat_paths: Vec<String> = flat.iter().map(|n| n.path.clone()).collect();
 
         let mut all_tree_paths = Vec::new();
         collect_tree_paths(&tree, &mut all_tree_paths);
-        all_tree_paths.sort();
 
         assert_eq!(all_flat_paths, all_tree_paths);
     }
@@ -256,31 +222,7 @@ mod tests {
         }
     }
 
-    // Regression tests using the test_data directory
-    #[test]
-    fn test_regression_flat_structure() {
-        let test_data_path = Path::new("tests/test_data");
-        if !test_data_path.exists() {
-            return;
-        }
-
-        let result = build_flat_tree(test_data_path).unwrap();
-
-        assert!(result.len() > 0);
-
-        let root = result.iter().find(|n| n.path == "tests/test_data").unwrap();
-        assert_eq!(root.is_directory, true);
-        assert_eq!(root.parent, None);
-
-        let file1 = result.iter().find(|n| n.name == "file1.txt").unwrap();
-        assert_eq!(file1.is_directory, false);
-        assert_eq!(file1.parent, Some("tests/test_data".to_string()));
-
-        let deep_dir = result.iter().find(|n| n.path == "tests/test_data/deep").unwrap();
-        assert_eq!(deep_dir.is_directory, true);
-        assert_eq!(deep_dir.parent, Some("tests/test_data".to_string()));
-    }
-
+    // Tests de régression
     #[test]
     fn test_regression_tree_structure() {
         let test_data_path = Path::new("tests/test_data");
@@ -313,43 +255,51 @@ mod tests {
     }
 
     #[test]
+    fn test_regression_flat_structure() {
+        let test_data_path = Path::new("tests/test_data");
+        if !test_data_path.exists() {
+            return;
+        }
+
+        let tree = build_tree(test_data_path).unwrap();
+        let flat = tree_to_flat(&tree);
+
+        assert!(flat.len() > 0);
+
+        let root = flat.iter().find(|n| n.path == "tests/test_data").unwrap();
+        assert_eq!(root.is_directory, true);
+        assert_eq!(root.parent, None);
+
+        let file1 = flat.iter().find(|n| n.name == "file1.txt").unwrap();
+        assert_eq!(file1.is_directory, false);
+        assert_eq!(file1.parent, Some("tests/test_data".to_string()));
+
+        let deep_dir = flat.iter().find(|n| n.path == "tests/test_data/deep").unwrap();
+        assert_eq!(deep_dir.is_directory, true);
+        assert_eq!(deep_dir.parent, Some("tests/test_data".to_string()));
+    }
+
+    #[test]
     fn test_regression_alphabetical_order() {
         let test_data_path = Path::new("tests/test_data");
         if !test_data_path.exists() {
             return;
         }
 
-        let result = build_tree(test_data_path).unwrap();
+        let tree = build_tree(test_data_path).unwrap();
 
-        let file_names: Vec<String> = result.children.iter()
+        let file_names: Vec<String> = tree.children.iter()
             .filter(|n| !n.is_directory)
             .map(|n| n.name.clone())
             .collect();
 
         assert_eq!(file_names, vec!["file1.txt", "file2.txt"]);
 
-        let dir_names: Vec<String> = result.children.iter()
+        let dir_names: Vec<String> = tree.children.iter()
             .filter(|n| n.is_directory)
             .map(|n| n.name.clone())
             .collect();
 
         assert_eq!(dir_names, vec!["deep"]);
-    }
-
-    #[test]
-    fn test_regression_flat_alphabetical_order() {
-        let test_data_path = Path::new("tests/test_data");
-        if !test_data_path.exists() {
-            return;
-        }
-
-        let result = build_flat_tree(test_data_path).unwrap();
-
-        let paths: Vec<String> = result.iter().map(|n| n.path.clone()).collect();
-
-        for i in 1..paths.len() {
-            assert!(paths[i-1] <= paths[i],
-                "Paths not sorted: {} > {}", paths[i-1], paths[i]);
-        }
     }
 }

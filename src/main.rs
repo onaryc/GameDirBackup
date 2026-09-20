@@ -1,7 +1,27 @@
-use file_tree_json::{build_flat_tree, build_tree};
+use file_tree_json::{build_tree, tree_to_flat, TreeNode};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::time::Instant;
+
+fn count_nodes(node: &TreeNode) -> (usize, usize) {
+    let mut file_count = 0;
+    let mut dir_count = 0;
+
+    if node.is_directory {
+        dir_count += 1;
+    } else {
+        file_count += 1;
+    }
+
+    for child in &node.children {
+        let (child_files, child_dirs) = count_nodes(child);
+        file_count += child_files;
+        dir_count += child_dirs;
+    }
+
+    (file_count, dir_count)
+}
 
 fn print_usage() {
     eprintln!("Usage: file_tree_json [OPTIONS] [PATH] [--output FILE]");
@@ -64,22 +84,23 @@ fn main() {
 
     let json_result = match mode {
         "flat" => {
-            match build_flat_tree(Path::new(path)) {
-                Ok(nodes) => serde_json::to_string_pretty(&nodes),
-                Err(e) => {
-                    eprintln!("Erreur: {}", e);
-                    std::process::exit(1);
-                }
-            }
+            let start = Instant::now();
+            let tree = build_tree(Path::new(path)).unwrap();
+            let (file_count, dir_count) = count_nodes(&tree);
+            eprintln!("DEBUG: build_tree took {:?} - {} files, {} directories", start.elapsed(), file_count, dir_count);
+
+            let start_flat = Instant::now();
+            let flat_nodes = tree_to_flat(&tree);
+            eprintln!("DEBUG: tree_to_flat took {:?} for {} nodes", start_flat.elapsed(), flat_nodes.len());
+
+            serde_json::to_string_pretty(&flat_nodes)
         }
         "tree" | _ => {
-            match build_tree(Path::new(path)) {
-                Ok(tree) => serde_json::to_string_pretty(&tree),
-                Err(e) => {
-                    eprintln!("Erreur: {}", e);
-                    std::process::exit(1);
-                }
-            }
+            let start = Instant::now();
+            let tree = build_tree(Path::new(path)).unwrap();
+            let (file_count, dir_count) = count_nodes(&tree);
+            eprintln!("DEBUG: build_tree took {:?} - {} files, {} directories", start.elapsed(), file_count, dir_count);
+            serde_json::to_string_pretty(&tree)
         }
     };
 
