@@ -162,13 +162,7 @@ fn build_file_node_parallel(path: &Path) -> Result<RootNode, std::io::Error> {
 
     let mut flat_nodes = Arc::try_unwrap(nodes).unwrap().into_inner().unwrap();
     // Ordre non garanti en parallèle : on trie pour un résultat déterministe.
-    flat_nodes.sort_by(|a, b| {
-        if a.depth == b.depth {
-            a.path.cmp(&b.path)
-        } else {
-            a.depth.cmp(&b.depth)
-        }
-    });
+    flat_nodes.sort_by(|a, b| {a.path.cmp(&b.path)});
 
     Ok(RootNode {
         files_nb: *files_nb.lock().unwrap(),
