@@ -4,12 +4,15 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
     Terminal,
 };
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         MouseButton, MouseEventKind,
     },
     execute,
@@ -57,8 +60,13 @@ struct App {
 
     selected: usize,
     scroll_offset: usize,
+    horizontal_offset: usize,
+    /// Largeur (en caractères) de la ligne la plus longue de `display_items`,
+    /// recalculée uniquement lors d'une reconstruction (`ensure_display_items`).
+    max_line_width: usize,
 
     viewport_height: usize,
+    viewport_width: usize,
     list_area_y: u16,
     list_area_height: u16,
 }
@@ -77,7 +85,10 @@ impl App {
             dirty: true,
             selected: 0,
             scroll_offset: 0,
+            horizontal_offset: 0,
+            max_line_width: 0,
             viewport_height: 24,
+            viewport_width: 80,
             list_area_y: 0,
             list_area_height: 0,
         };
@@ -109,6 +120,13 @@ impl App {
         };
         self.dirty = false;
 
+        self.max_line_width = self
+            .display_items
+            .iter()
+            .map(|item| Self::item_width(self.mode, item))
+            .max()
+            .unwrap_or(0);
+
         // On retrouve la même sélection si possible, sinon on borne l'index.
         self.selected = previously_selected_path
             .and_then(|path| self.display_items.iter().position(|item| item.path == path))
@@ -116,6 +134,22 @@ impl App {
             .min(self.display_items.len().saturating_sub(1));
 
         self.ensure_selected_visible();
+        self.clamp_horizontal_scroll();
+    }
+
+    /// Largeur (en caractères) qu'occupera `item` une fois formaté pour
+    /// l'affichage — calculée arithmétiquement (sans allouer de String) pour
+    /// pouvoir être appliquée à tous les éléments sans coût significatif.
+    /// Doit rester cohérente avec le formatage réel fait par `render_item`.
+    fn item_width(mode: ViewMode, item: &DisplayItem) -> usize {
+        const PREFIX_WIDTH: usize = 2; // icône + espace
+        match mode {
+            ViewMode::Tree => {
+                let indent = item.depth.saturating_sub(1) * 2;
+                indent + PREFIX_WIDTH + item.name.chars().count()
+            }
+            ViewMode::Flat => PREFIX_WIDTH + item.path.chars().count(),
+        }
     }
 
     fn build_flat_display_items(&self) -> Vec<DisplayItem> {
@@ -251,6 +285,17 @@ impl App {
         self.scroll_offset = self.scroll_offset.min(max_offset);
     }
 
+    fn scroll_horizontal_by(&mut self, delta: isize) {
+        let max_offset = self.max_line_width.saturating_sub(self.viewport_width.max(1));
+        let new_offset = (self.horizontal_offset as isize + delta).max(0) as usize;
+        self.horizontal_offset = new_offset.min(max_offset);
+    }
+
+    fn clamp_horizontal_scroll(&mut self) {
+        let max_offset = self.max_line_width.saturating_sub(self.viewport_width.max(1));
+        self.horizontal_offset = self.horizontal_offset.min(max_offset);
+    }
+
     /// Recale la vue pour que la sélection soit visible. À appeler
     /// uniquement après un déplacement de sélection (clavier/clic/reconstruction
     /// de la liste) — jamais à chaque frame, sinon ça annule un scroll molette
@@ -264,11 +309,10 @@ impl App {
     }
 
     fn handle_click(&mut self, row: u16) {
-        if row < self.list_area_y + 1 || row >= self.list_area_y + self.list_area_height {
+        if row < self.list_area_y || row >= self.list_area_y + self.list_area_height {
             return;
         }
-        let index = self.scroll_offset + (row - self.list_area_y - 1) as usize;
-
+        let index = self.scroll_offset + (row - self.list_area_y) as usize;
         if index >= self.display_items.len() {
             return;
         }
@@ -309,7 +353,13 @@ impl App {
             ViewMode::Flat => format!("{}{}", prefix, item.path),
         };
 
-        ListItem::new(Line::from(Span::styled(content, style)))
+        let visible_content: String = if self.horizontal_offset > 0 {
+            content.chars().skip(self.horizontal_offset).collect()
+        } else {
+            content
+        };
+
+        ListItem::new(Line::from(Span::styled(visible_content, style)))
     }
 
     fn info_text(&self) -> Text<'static> {
@@ -320,7 +370,10 @@ impl App {
             "  Q/Esc: Quitter   Tab: Flat/Tree   ↑/↓: Naviguer   PgUp/PgDn: Scroll rapide",
         ));
         lines.push(Line::from(
-            "  →/Entrée: Déplier   ←: Replier   Clic gauche: Sélection/Déplier   Molette: Scroll",
+            "  →/Entrée: Déplier   ←: Replier   Clic gauche: Sélection/Déplier",
+        ));
+        lines.push(Line::from(
+            "  Molette: Scroll vertical   Maj+←/→: Scroll horizontal",
         ));
         lines.push(Line::from(""));
 
@@ -379,6 +432,12 @@ fn event_loop(
                             KeyCode::PageUp => app.page_up(),
                             KeyCode::Home => app.go_to_start(),
                             KeyCode::End => app.go_to_end(),
+                            KeyCode::Left if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
+                                app.scroll_horizontal_by(-4)
+                            }
+                            KeyCode::Right if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
+                                app.scroll_horizontal_by(4)
+                            }
                             KeyCode::Right => app.expand_selected(),
                             KeyCode::Left => app.collapse_selected(),
                             KeyCode::Enter => {
@@ -396,6 +455,8 @@ fn event_loop(
                     MouseEventKind::Down(MouseButton::Right) => break,
                     MouseEventKind::ScrollUp => app.scroll_by(-3),
                     MouseEventKind::ScrollDown => app.scroll_by(3),
+                    MouseEventKind::ScrollLeft => app.scroll_horizontal_by(-4),
+                    MouseEventKind::ScrollRight => app.scroll_horizontal_by(4),
                     _ => {}
                 },
                 _ => {}
@@ -427,10 +488,12 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(7)])
         .split(inner);
 
-    app.list_area_y = layout[0].y;
-    app.list_area_height = layout[0].height;
-    app.viewport_height = layout[0].height as usize;
+    app.list_area_y = layout[0].y + 1; // +1 : la bordure du haut occupe la 1re ligne
+    app.list_area_height = layout[0].height.saturating_sub(2);
+    app.viewport_height = app.list_area_height as usize;
+    app.viewport_width = layout[0].width.saturating_sub(2) as usize; // moins les bordures gauche/droite
     app.clamp_scroll();
+    app.clamp_horizontal_scroll();
 
     let list_title = format!(
         " {} ({}/{}) ",
@@ -455,6 +518,24 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
     list_state.select(selected_is_visible.then(|| app.selected - app.scroll_offset));
     f.render_stateful_widget(list, layout[0], &mut list_state);
 
+    // Scrollbar verticale, affichée sur la bordure droite du bloc liste.
+    let mut v_scrollbar_state =
+        ScrollbarState::new(app.display_items.len()).position(app.scroll_offset);
+    let v_scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .style(Style::default().fg(Color::Cyan));
+    f.render_stateful_widget(v_scrollbar, layout[0], &mut v_scrollbar_state);
+
+    // Scrollbar horizontale, affichée sur la bordure basse du bloc liste.
+    let mut h_scrollbar_state =
+        ScrollbarState::new(app.max_line_width).position(app.horizontal_offset);
+    let h_scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .style(Style::default().fg(Color::Cyan));
+    f.render_stateful_widget(h_scrollbar, layout[0], &mut h_scrollbar_state);
+
     let info_block = Block::default()
         .title(" Informations ".bold())
         .borders(Borders::ALL)
@@ -478,7 +559,7 @@ fn print_usage() {
     println!("  Up/Down: Navigate          PageUp/PageDown: Fast scroll");
     println!("  Right/Enter: Expand        Left: Collapse");
     println!("  Left click: Select/Toggle  Right click: Quit");
-    println!("  Mouse wheel: Scroll view");
+    println!("  Mouse wheel: Vertical scroll   Shift+Left/Right: Horizontal scroll");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
