@@ -280,72 +280,87 @@ fn run_app(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
         app.ensure_visible_nodes_loaded();
 
+        // let root_node = match build_tree(path) {
+        //     Ok(tree) => {
+        //         Some(Arc::new(LazyTreeNode::from_tree_node(tree)))
+        //     }
+        //     Err(e) => {
+        //         eprintln!("Error building tree: {}", e);
+        //         None
+        //     }
+        // };
         if event::poll(std::time::Duration::from_millis(16))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                        KeyCode::Down => {
-                            let items_count = app.get_items().len();
-                            if app.scroll < items_count.saturating_sub(1) {
-                                app.scroll += 1;
-                            }
-                        }
-                        KeyCode::Up => {
-                            if app.scroll > 0 {
-                                app.scroll -= 1;
-                            }
-                        }
-                        KeyCode::PageDown => {
-                            let items_count = app.get_items().len();
-                            app.scroll = std::cmp::min(app.scroll + app.viewport_height / 2, items_count.saturating_sub(1));
-                            app.ensure_visible_nodes_loaded();
-                        }
-                        KeyCode::PageUp => {
-                            app.scroll = app.scroll.saturating_sub(app.viewport_height / 2);
-                        }
-                        KeyCode::Enter => {
-                            let visible_items = app.get_visible_tree_items();
-                            if app.scroll < visible_items.len() {
-                                let node = &visible_items[app.scroll].0;
-                                if node.is_directory {
-                                    app.load_node_if_needed(&node.path);
-                                    app.toggle_expand(&node.path);
+            match event::read()? {
+                // Event::FocusGained => null,
+                // Event::FocusLost => null,
+                Event::Key(key_event) => {
+                    if key_event.kind == KeyEventKind::Press {
+                        match key_event.code {
+                            KeyCode::Esc => break,
+                            KeyCode::Down => {
+                                let items_count = app.get_items().len();
+                                if app.scroll < items_count.saturating_sub(1) {
+                                    app.scroll += 1;
                                 }
                             }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if let Event::Mouse(mouse_event) = event::read()? {
-                match mouse_event.kind {
-                    MouseEventKind::Down(button) => {
-                        match button {
-                            MouseButton::Left => {
-                                app.handle_click(mouse_event.row, mouse_event.column);
+                            KeyCode::Up => {
+                                if app.scroll > 0 {
+                                    app.scroll -= 1;
+                                }
                             }
-                            MouseButton::Right => {
-                                break;
+                            KeyCode::PageDown => {
+                                let items_count = app.get_items().len();
+                                app.scroll = std::cmp::min(app.scroll + app.viewport_height / 2, items_count.saturating_sub(1));
+                                app.ensure_visible_nodes_loaded();
+                            }
+                            KeyCode::PageUp => {
+                                app.scroll = app.scroll.saturating_sub(app.viewport_height / 2);
+                            }
+                            KeyCode::Enter => {
+                                let visible_items = app.get_visible_tree_items();
+                                if app.scroll < visible_items.len() {
+                                    let node = &visible_items[app.scroll].0;
+                                    if node.is_directory {
+                                        app.load_node_if_needed(&node.path);
+                                        app.toggle_expand(&node.path);
+                                    }
+                                }
                             }
                             _ => {}
                         }
                     }
-                    MouseEventKind::ScrollUp => {
-                        if app.scroll > 0 {
-                            app.scroll = app.scroll.saturating_sub(3);
+                },
+                Event::Mouse(mouse_event) => {
+                    match mouse_event.kind {
+                        MouseEventKind::Down(button) => {
+                            match button {
+                                MouseButton::Left => {
+                                    app.handle_click(mouse_event.row, mouse_event.column);
+                                }
+                                MouseButton::Right => {
+                                    break;
+                                }
+                                _ => {}
+                            }
                         }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        let items_count = app.get_items().len();
-                        if app.scroll < items_count.saturating_sub(1) {
-                            app.scroll = std::cmp::min(app.scroll + 3, items_count.saturating_sub(1));
-                            app.ensure_visible_nodes_loaded();
+                        MouseEventKind::ScrollUp => {
+                            if app.scroll > 0 {
+                                app.scroll = app.scroll.saturating_sub(3);
+                            }
                         }
+                        MouseEventKind::ScrollDown => {
+                            let items_count = app.get_items().len();
+                            if app.scroll < items_count.saturating_sub(1) {
+                                app.scroll = std::cmp::min(app.scroll + 3, items_count.saturating_sub(1));
+                                app.ensure_visible_nodes_loaded();
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
+                },
+                // Event::Paste(data) => null,
+                // Event::Resize(width, height) => null,
+                _ => {}
             }
         }
     }
