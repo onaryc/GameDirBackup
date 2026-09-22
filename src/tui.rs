@@ -264,10 +264,11 @@ impl App {
     }
 
     fn handle_click(&mut self, row: u16) {
-        if row < self.list_area_y || row >= self.list_area_y + self.list_area_height {
+        if row < self.list_area_y + 1 || row >= self.list_area_y + self.list_area_height {
             return;
         }
-        let index = self.scroll_offset + (row - self.list_area_y -1) as usize;
+        let index = self.scroll_offset + (row - self.list_area_y - 1) as usize;
+
         if index >= self.display_items.len() {
             return;
         }
