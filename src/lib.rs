@@ -1,5 +1,5 @@
 use serde::Serialize;
-// use std::fs;
+use std::collections::HashMap;
 use std::path::Path;
 
 use ignore::Walk;
@@ -12,48 +12,55 @@ pub enum TraversalMode {
     Parallel,
 }
 
-// #[derive(Serialize, Debug, PartialEq, Clone)]
-// pub struct FlatNode {
-//     pub name: String,
-//     pub path: String,
-//     pub is_directory: bool,
-//     pub parent: Option<String>,
-// }
-
 #[derive(Serialize, Debug, PartialEq, Clone)]
 pub struct RootNode {
     pub files_nb: usize,
     pub dirs_nb: usize,
-    pub nodes: Vec<TreeNode>,
+    pub nodes: Vec<FileNode>,
 }
 
 #[derive(Serialize, Debug, PartialEq, Clone)]
-pub struct TreeNode {
+pub struct FileNode {
     pub name: String,
     pub path: String,
     pub is_directory: bool,
     pub depth: usize,
-    pub children: Vec<TreeNode>,
+    /// Chemin du dossier parent. Toujours `Some(...)` en pratique, puisque
+    /// le dossier scanné lui-même n'est jamais transformé en `FileNode`
+    /// (il est déjà représenté implicitement par `RootNode`).
+    pub parent: Option<String>,
+    /// Rempli uniquement après un appel à `to_tree`. Toujours vide dans le
+    /// résultat brut de `build_file_node`.
+    pub children: Vec<FileNode>,
 }
 
-/// Construit une arborescence de fichiers/dossiers en mode Tree (imbriqué)
-pub fn build_tree(path: &Path, traversal_mode: TraversalMode, force_canonical_path: bool) -> Result<RootNode, std::io::Error> {
+/// Parcourt `path` et renvoie une liste **plate** de `FileNode` (chacun
+/// connaît le chemin de son parent via `parent`, mais `children` reste
+/// vide). Pour obtenir une arborescence imbriquée, appeler `to_tree` sur
+/// le résultat.
+pub fn build_file_node(
+    path: &Path,
+    traversal_mode: TraversalMode,
+    force_canonical_path: bool,
+) -> Result<RootNode, std::io::Error> {
     let path_str = if force_canonical_path {
-        std::fs::canonicalize(path).unwrap().into_os_string().into_string().unwrap()
+        std::fs::canonicalize(path)?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "chemin non UTF-8"))?
     } else {
         path.to_string_lossy().into_owned()
     };
 
-    // let tmp = std::fs::canonicalize(path).unwrap().into_os_string().into_string().unwrap();
     let new_path = Path::new(&path_str);
 
     match traversal_mode {
-        TraversalMode::Sequential => build_tree_sequential(new_path),
-        TraversalMode::Parallel => build_tree_parallel(new_path),
+        TraversalMode::Sequential => build_file_node_sequential(new_path),
+        TraversalMode::Parallel => build_file_node_parallel(new_path),
     }
 }
 
-fn build_tree_sequential(path: &Path) -> Result<RootNode, std::io::Error> {
+fn build_file_node_sequential(path: &Path) -> Result<RootNode, std::io::Error> {
     let mut root_node = RootNode {
         files_nb: 0,
         dirs_nb: 0,
@@ -63,331 +70,247 @@ fn build_tree_sequential(path: &Path) -> Result<RootNode, std::io::Error> {
     for result in Walk::new(path) {
         match result {
             Ok(entry) => {
-                let is_directory = entry.file_type().unwrap().is_dir(); // entry.path().is_dir() is too slow
-
-                let child_node = TreeNode {
-                    name: entry.path().file_name().unwrap_or_else(|| path.as_os_str()).to_string_lossy().into_owned(),
-                    path: entry.path().to_string_lossy().into_owned(),
-                    is_directory: is_directory,
-                    depth: entry.depth(),
-                    children: Vec::new(),
+                let is_directory = match entry.file_type() {
+                    Some(ft) => ft.is_dir(),
+                    None => false, // type indéterminable (ex: lien symbolique cassé)
                 };
 
-                root_node.nodes.push(child_node);
-                if is_directory {root_node.dirs_nb +=1} else {root_node.files_nb +=1}
-                
-                // println!("{}", entry.path().display())
-            },
-            Err(err) => println!("ERROR: {}", err),
+                if is_directory {
+                    root_node.dirs_nb += 1
+                } else {
+                    root_node.files_nb += 1
+                }
+
+                // Le dossier scanné lui-même (depth 0) n'est pas un FileNode.
+                if entry.depth() == 0 {
+                    continue;
+                }
+
+                root_node.nodes.push(FileNode {
+                    name: entry
+                        .path()
+                        .file_name()
+                        .unwrap_or_else(|| path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned(),
+                    path: entry.path().to_string_lossy().into_owned(),
+                    is_directory,
+                    depth: entry.depth(),
+                    parent: entry.path().parent().map(|p| p.to_string_lossy().into_owned()),
+                    children: Vec::new(),
+                });
+            }
+            Err(err) => eprintln!("ERROR: {}", err),
         }
     }
 
     Ok(root_node)
 }
 
-fn build_tree_parallel(path: &Path) -> Result<RootNode, std::io::Error> {
-    let mut root_node = RootNode {
-        files_nb: 0,
-        dirs_nb: 0,
-        nodes: Vec::new(),
-    };
+fn build_file_node_parallel(path: &Path) -> Result<RootNode, std::io::Error> {
+    let nodes: Arc<Mutex<Vec<FileNode>>> = Arc::new(Mutex::new(vec![]));
+    let files_nb = Arc::new(Mutex::new(0usize));
+    let dirs_nb = Arc::new(Mutex::new(0usize));
 
-    let nodes = Arc::new(Mutex::new(vec![]));
-    let files_nb = Arc::new(Mutex::new(0));
-    let dirs_nb = Arc::new(Mutex::new(0));
+    let walker = WalkBuilder::new(path)
+        .threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+        .build_parallel();
 
-    let walker = WalkBuilder::new(path).threads(6).build_parallel();
     walker.run(|| {
         let nodes = nodes.clone();
         let files_nb = files_nb.clone();
         let dirs_nb = dirs_nb.clone();
 
-        Box::new(move | result | {
+        Box::new(move |result| {
             use ignore::WalkState::*;
 
             match result {
                 Ok(entry) => {
-                    let is_directory = entry.file_type().unwrap().is_dir(); // entry.path().is_dir() is too slow
-
-                    
-                    // let path_str = entry.path().to_string_lossy().into_owned();
-                    // let tmp = std::fs::canonicalize(entry.path()).unwrap().into_os_string().into_string().unwrap();
-                    // let tmp = std::fs::canonicalize(entry.path().as_ref()).unwrap();
-                    // let tmp2 = tmp.into_os_string().into_string().unwrap();
-
-                    let child_node = TreeNode {
-                        name: entry.path().file_name().unwrap_or_else(|| path.as_os_str()).to_string_lossy().into_owned(),
-                        // path: path_str,
-                        path: entry.path().to_string_lossy().into_owned(),
-                        is_directory: is_directory,
-                        depth: entry.depth(),
-                        children: Vec::new(),
+                    let is_directory = match entry.file_type() {
+                        Some(ft) => ft.is_dir(),
+                        None => false,
                     };
 
-                    nodes.lock().unwrap().push(child_node);
-                  
-                    if is_directory {*dirs_nb.lock().unwrap() += 1} else {*files_nb.lock().unwrap() += 1}
-                    
-                    // println!("{}", entry.path().display())
-                },
-                Err(err) => println!("ERROR: {}", err),
+                    if is_directory {
+                        *dirs_nb.lock().unwrap() += 1
+                    } else {
+                        *files_nb.lock().unwrap() += 1
+                    }
+
+                    if entry.depth() != 0 {
+                        nodes.lock().unwrap().push(FileNode {
+                            name: entry
+                                .path()
+                                .file_name()
+                                .unwrap_or_else(|| path.as_os_str())
+                                .to_string_lossy()
+                                .into_owned(),
+                            path: entry.path().to_string_lossy().into_owned(),
+                            is_directory,
+                            depth: entry.depth(),
+                            parent: entry.path().parent().map(|p| p.to_string_lossy().into_owned()),
+                            children: Vec::new(),
+                        });
+                    }
+                }
+                Err(err) => eprintln!("ERROR: {}", err),
             }
 
-            // println!("{:?}", result);
             Continue
         })
-        
     });
 
-    root_node.nodes = nodes.lock().unwrap().to_vec();
-    // root_node.nodes.sort_by(|a, b| b.path.cmp(&a.path));
-    root_node.nodes.sort_by(| a, b | if a.depth == b.depth {
-        a.path.partial_cmp(&b.path).unwrap()
+    let mut flat_nodes = Arc::try_unwrap(nodes).unwrap().into_inner().unwrap();
+    // Ordre non garanti en parallèle : on trie pour un résultat déterministe.
+    flat_nodes.sort_by(|a, b| {
+        if a.depth == b.depth {
+            a.path.cmp(&b.path)
         } else {
-        a.depth.partial_cmp(&b.depth).unwrap()
+            a.depth.cmp(&b.depth)
+        }
     });
 
-    root_node.files_nb = *files_nb.lock().unwrap();
-    root_node.dirs_nb = *dirs_nb.lock().unwrap();
-
-    Ok(root_node)
+    Ok(RootNode {
+        files_nb: *files_nb.lock().unwrap(),
+        dirs_nb: *dirs_nb.lock().unwrap(),
+        nodes: flat_nodes,
+    })
 }
 
-// Convertit une arborescence TreeNode en une liste plate de FlatNode
-// pub fn tree_to_flat(tree: &TreeNode) -> Vec<FlatNode> {
-//     let mut flat_nodes = Vec::new();
-//     build_flat_from_tree(tree, None, &mut flat_nodes);
-//     flat_nodes
-// }
+/// Transforme une liste plate de `FileNode` (telle que renvoyée par
+/// `build_file_node`) en arborescence imbriquée : les nœuds de premier
+/// niveau (enfants directs du dossier scanné) se retrouvent dans
+/// `RootNode.nodes`, chacun avec ses propres enfants dans `children`.
+///
+/// Fonctionne quel que soit l'ordre des nœuds en entrée : les nœuds les
+/// plus profonds sont rattachés à leur parent en premier, de sorte que
+/// lorsqu'un nœud est à son tour déplacé chez son propre parent, ses
+/// enfants lui sont déjà attachés.
+pub fn to_tree(flat_root: &RootNode) -> RootNode {
+    let mut by_path: HashMap<String, FileNode> = flat_root
+        .nodes
+        .iter()
+        .cloned()
+        .map(|node| (node.path.clone(), node))
+        .collect();
 
-// fn build_flat_from_tree(node: &TreeNode, parent_path: Option<String>, flat_nodes: &mut Vec<FlatNode>) {
-//     let flat_node = FlatNode {
-//         name: node.name.clone(),
-//         path: node.path.clone(),
-//         is_directory: node.is_directory,
-//         parent: parent_path.clone(),
-//     };
-//     flat_nodes.push(flat_node);
+    let mut order: Vec<String> = by_path.keys().cloned().collect();
+    order.sort_by_key(|p| std::cmp::Reverse(by_path[p].depth));
 
-//     if node.is_directory {
-//         for child in &node.children {
-//             build_flat_from_tree(child, Some(node.path.clone()), flat_nodes);
-//         }
-//     }
-// }
+    let mut top_level = Vec::new();
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use std::fs::File;
-//     use tempfile::tempdir;
+    for path in order {
+        let Some(node) = by_path.remove(&path) else {
+            continue;
+        };
 
-//     #[test]
-//     fn test_build_tree_empty_directory() {
-//         let dir = tempdir().unwrap();
-//         let path = dir.path();
+        match node.parent.as_ref().and_then(|pp| by_path.get_mut(pp)) {
+            Some(parent) => parent.children.push(node),
+            None => top_level.push(node), // parent = dossier scanné, absent de la map
+        }
+    }
 
-//         let result = build_tree(path).unwrap();
+    sort_tree(&mut top_level);
 
-//         assert_eq!(result.name, path.file_name().unwrap().to_string_lossy());
-//         assert_eq!(result.is_directory, true);
-//         assert_eq!(result.children.len(), 0);
-//     }
+    RootNode {
+        files_nb: flat_root.files_nb,
+        dirs_nb: flat_root.dirs_nb,
+        nodes: top_level,
+    }
+}
 
-//     #[test]
-//     fn test_build_tree_single_file() {
-//         let dir = tempdir().unwrap();
-//         let file_path = dir.path().join("test.txt");
-//         File::create(&file_path).unwrap();
+/// Trie récursivement l'arbre : dossiers avant fichiers, puis ordre alphabétique.
+fn sort_tree(nodes: &mut Vec<FileNode>) {
+    nodes.sort_by(|a, b| match (a.is_directory, b.is_directory) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.cmp(&b.name),
+    });
 
-//         let result = build_tree(dir.path()).unwrap();
+    for node in nodes.iter_mut() {
+        sort_tree(&mut node.children);
+    }
+}
 
-//         assert_eq!(result.is_directory, true);
-//         assert_eq!(result.children.len(), 1);
-//         assert_eq!(result.children[0].name, "test.txt");
-//         assert_eq!(result.children[0].is_directory, false);
-//     }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use tempfile::tempdir;
 
-//     #[test]
-//     fn test_build_tree_nested_structure() {
-//         let dir = tempdir().unwrap();
-//         let subdir = dir.path().join("subdir");
-//         fs::create_dir(&subdir).unwrap();
-//         File::create(subdir.join("file.txt")).unwrap();
+    #[test]
+    fn test_build_file_node_is_flat() {
+        let dir = tempdir().unwrap();
+        let subdir = dir.path().join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        File::create(dir.path().join("file1.txt")).unwrap();
+        File::create(subdir.join("file2.txt")).unwrap();
 
-//         let result = build_tree(dir.path()).unwrap();
+        let result = build_file_node(dir.path(), TraversalMode::Sequential, false).unwrap();
 
-//         assert_eq!(result.is_directory, true);
-//         assert_eq!(result.children.len(), 1);
-//         assert_eq!(result.children[0].name, "subdir");
-//         assert_eq!(result.children[0].is_directory, true);
-//         assert_eq!(result.children[0].children.len(), 1);
-//         assert_eq!(result.children[0].children[0].name, "file.txt");
-//     }
+        assert_eq!(result.files_nb, 2);
+        assert_eq!(result.dirs_nb, 1);
+        // 3 entrées à plat: file1.txt, subdir, subdir/file2.txt
+        assert_eq!(result.nodes.len(), 3);
+        assert!(result.nodes.iter().all(|n| n.children.is_empty()));
 
-//     #[test]
-//     fn test_build_tree_multiple_files() {
-//         let dir = tempdir().unwrap();
-//         File::create(dir.path().join("a.txt")).unwrap();
-//         File::create(dir.path().join("b.txt")).unwrap();
-//         File::create(dir.path().join("c.txt")).unwrap();
+        let file2 = result.nodes.iter().find(|n| n.name == "file2.txt").unwrap();
+        assert_eq!(file2.parent, Some(subdir.to_string_lossy().into_owned()));
+    }
 
-//         let result = build_tree(dir.path()).unwrap();
+    #[test]
+    fn test_to_tree_nested_structure() {
+        let dir = tempdir().unwrap();
+        let subdir = dir.path().join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        File::create(dir.path().join("file1.txt")).unwrap();
+        File::create(subdir.join("file2.txt")).unwrap();
 
-//         assert_eq!(result.children.len(), 3);
-//         assert_eq!(result.children[0].name, "a.txt");
-//         assert_eq!(result.children[1].name, "b.txt");
-//         assert_eq!(result.children[2].name, "c.txt");
-//     }
+        let flat = build_file_node(dir.path(), TraversalMode::Sequential, false).unwrap();
+        let tree = to_tree(&flat);
 
-//     #[test]
-//     fn test_tree_to_flat() {
-//         let dir = tempdir().unwrap();
-//         let subdir = dir.path().join("subdir");
-//         fs::create_dir(&subdir).unwrap();
-//         File::create(dir.path().join("file1.txt")).unwrap();
-//         File::create(subdir.join("file2.txt")).unwrap();
+        assert_eq!(tree.files_nb, flat.files_nb);
+        assert_eq!(tree.dirs_nb, flat.dirs_nb);
+        assert_eq!(tree.nodes.len(), 2); // "file1.txt" et "subdir" au premier niveau
 
-//         let tree = build_tree(dir.path()).unwrap();
-//         let flat = tree_to_flat(&tree);
+        let subdir_node = tree.nodes.iter().find(|n| n.name == "subdir").unwrap();
+        assert!(subdir_node.is_directory);
+        assert_eq!(subdir_node.children.len(), 1);
+        assert_eq!(subdir_node.children[0].name, "file2.txt");
+        assert!(!subdir_node.children[0].is_directory);
+    }
 
-//         assert_eq!(flat.len(), 4); // root, file1.txt, subdir, file2.txt
+    #[test]
+    fn test_to_tree_deeply_nested() {
+        let dir = tempdir().unwrap();
+        let deep = dir.path().join("a").join("b").join("c");
+        fs::create_dir_all(&deep).unwrap();
+        File::create(deep.join("file.txt")).unwrap();
 
-//         // Vérifier que la racine a parent = None
-//         let root_flat = flat.iter().find(|n| n.path == dir.path().to_string_lossy()).unwrap();
-//         assert_eq!(root_flat.parent, None);
+        let flat = build_file_node(dir.path(), TraversalMode::Sequential, false).unwrap();
+        let tree = to_tree(&flat);
 
-//         // Vérifier que file1.txt a pour parent la racine
-//         let file1 = flat.iter().find(|n| n.name == "file1.txt").unwrap();
-//         assert_eq!(file1.parent, Some(dir.path().to_string_lossy().into_owned()));
-//         assert_eq!(file1.is_directory, false);
+        let a = &tree.nodes[0];
+        assert_eq!(a.name, "a");
+        let b = &a.children[0];
+        assert_eq!(b.name, "b");
+        let c = &b.children[0];
+        assert_eq!(c.name, "c");
+        assert_eq!(c.children[0].name, "file.txt");
+    }
 
-//         // Vérifier que subdir a pour parent la racine
-//         let subdir_flat = flat.iter().find(|n| n.name == "subdir").unwrap();
-//         assert_eq!(subdir_flat.parent, Some(dir.path().to_string_lossy().into_owned()));
-//         assert_eq!(subdir_flat.is_directory, true);
+    #[test]
+    fn test_sequential_and_parallel_produce_same_flat_result() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("subdir")).unwrap();
+        File::create(dir.path().join("a.txt")).unwrap();
+        File::create(dir.path().join("subdir").join("b.txt")).unwrap();
 
-//         // Vérifier que file2.txt a pour parent subdir
-//         let file2 = flat.iter().find(|n| n.name == "file2.txt").unwrap();
-//         assert_eq!(file2.parent, Some(subdir.to_string_lossy().into_owned()));
-//     }
+        let seq = build_file_node(dir.path(), TraversalMode::Sequential, false).unwrap();
+        let par = build_file_node(dir.path(), TraversalMode::Parallel, false).unwrap();
 
-//     #[test]
-//     fn test_build_tree_excludes_target() {
-//         let dir = tempdir().unwrap();
-//         let target_dir = dir.path().join("target");
-//         fs::create_dir(&target_dir).unwrap();
-//         File::create(target_dir.join("debug")).unwrap();
-
-//         let result = build_tree(dir.path()).unwrap();
-
-//         // Vérifier que target n'est pas dans les enfants
-//         assert!(!result.children.iter().any(|n| n.name == "target"));
-//     }
-
-//     #[test]
-//     fn test_tree_and_flat_consistency() {
-//         let dir = tempdir().unwrap();
-//         fs::create_dir(dir.path().join("subdir")).unwrap();
-//         File::create(dir.path().join("file1.txt")).unwrap();
-//         File::create(dir.path().join("subdir").join("file2.txt")).unwrap();
-
-//         let tree = build_tree(dir.path()).unwrap();
-//         let flat = tree_to_flat(&tree);
-
-//         let all_flat_paths: Vec<String> = flat.iter().map(|n| n.path.clone()).collect();
-
-//         let mut all_tree_paths = Vec::new();
-//         collect_tree_paths(&tree, &mut all_tree_paths);
-
-//         assert_eq!(all_flat_paths, all_tree_paths);
-//     }
-
-//     fn collect_tree_paths(node: &TreeNode, paths: &mut Vec<String>) {
-//         paths.push(node.path.clone());
-//         for child in &node.children {
-//             collect_tree_paths(child, paths);
-//         }
-//     }
-
-//     // Tests de régression
-//     #[test]
-//     fn test_regression_tree_structure() {
-//         let test_data_path = Path::new("tests/test_data");
-//         if !test_data_path.exists() {
-//             return;
-//         }
-
-//         let result = build_tree(test_data_path).unwrap();
-
-//         assert_eq!(result.name, "test_data");
-//         assert_eq!(result.is_directory, true);
-
-//         let file_nodes: Vec<&TreeNode> = result.children.iter()
-//             .filter(|n| !n.is_directory)
-//             .collect();
-//         assert_eq!(file_nodes.len(), 2);
-
-//         let deep_dir = result.children.iter()
-//             .find(|n| n.name == "deep")
-//             .unwrap();
-//         assert_eq!(deep_dir.is_directory, true);
-//         assert_eq!(deep_dir.children.len(), 2);
-
-//         let nested_dir = deep_dir.children.iter()
-//             .find(|n| n.name == "nested")
-//             .unwrap();
-//         assert_eq!(nested_dir.is_directory, true);
-//         assert_eq!(nested_dir.children.len(), 1);
-//         assert_eq!(nested_dir.children[0].name, "file4.txt");
-//     }
-
-//     #[test]
-//     fn test_regression_flat_structure() {
-//         let test_data_path = Path::new("tests/test_data");
-//         if !test_data_path.exists() {
-//             return;
-//         }
-
-//         let tree = build_tree(test_data_path).unwrap();
-//         let flat = tree_to_flat(&tree);
-
-//         assert!(flat.len() > 0);
-
-//         let root = flat.iter().find(|n| n.path == "tests/test_data").unwrap();
-//         assert_eq!(root.is_directory, true);
-//         assert_eq!(root.parent, None);
-
-//         let file1 = flat.iter().find(|n| n.name == "file1.txt").unwrap();
-//         assert_eq!(file1.is_directory, false);
-//         assert_eq!(file1.parent, Some("tests/test_data".to_string()));
-
-//         let deep_dir = flat.iter().find(|n| n.path == "tests/test_data/deep").unwrap();
-//         assert_eq!(deep_dir.is_directory, true);
-//         assert_eq!(deep_dir.parent, Some("tests/test_data".to_string()));
-//     }
-
-//     #[test]
-//     fn test_regression_alphabetical_order() {
-//         let test_data_path = Path::new("tests/test_data");
-//         if !test_data_path.exists() {
-//             return;
-//         }
-
-//         let tree = build_tree(test_data_path).unwrap();
-
-//         let file_names: Vec<String> = tree.children.iter()
-//             .filter(|n| !n.is_directory)
-//             .map(|n| n.name.clone())
-//             .collect();
-
-//         assert_eq!(file_names, vec!["file1.txt", "file2.txt"]);
-
-//         let dir_names: Vec<String> = tree.children.iter()
-//             .filter(|n| n.is_directory)
-//             .map(|n| n.name.clone())
-//             .collect();
-
-//         assert_eq!(dir_names, vec!["deep"]);
-//     }
-// }
+        assert_eq!(seq.files_nb, par.files_nb);
+        assert_eq!(seq.dirs_nb, par.dirs_nb);
+        assert_eq!(to_tree(&seq), to_tree(&par));
+    }
+}

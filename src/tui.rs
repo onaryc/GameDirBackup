@@ -1,372 +1,406 @@
-use file_tree_json::{build_tree, TreeNode};
+use file_tree_json::{build_file_node, to_tree, FileNode, RootNode, TraversalMode};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use std::collections::HashSet;
 use std::io::stdout;
 use std::path::Path;
-use std::sync::Arc;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
-#[derive(Clone, Debug)]
-struct LazyTreeNode {
-    name: String,
-    path: String,
-    is_directory: bool,
-    children: Vec<Arc<LazyTreeNode>>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Flat,
+    Tree,
 }
 
-impl LazyTreeNode {
-    fn from_tree_node(node: TreeNode) -> Self {
-        let children = node.children.into_iter()
-            .map(|child| Arc::new(Self::from_tree_node(child)))
-            .collect();
-
-        Self {
-            name: node.name,
-            path: node.path,
-            is_directory: node.is_directory,
-            children,
+impl ViewMode {
+    fn label(self) -> &'static str {
+        match self {
+            ViewMode::Flat => "Flat",
+            ViewMode::Tree => "Tree",
         }
     }
 }
 
+/// Représentation légère d'un `FileNode` pour l'affichage : on ne garde que
+/// ce dont le rendu a besoin, pour limiter le coût des reconstructions.
+#[derive(Clone)]
+struct DisplayItem {
+    name: String,
+    path: String,
+    is_directory: bool,
+    depth: usize,
+}
+
 struct App {
-    root_node: Option<Arc<LazyTreeNode>>,
-    scroll: usize,
+    flat: RootNode,
+    tree: RootNode,
+    mode: ViewMode,
+    /// Chemins des dossiers actuellement dépliés (mode Tree uniquement).
+    expanded: HashSet<String>,
+    /// Liste affichée courante, reconstruite uniquement quand `dirty` est vrai.
+    display_items: Vec<DisplayItem>,
+    dirty: bool,
+
+    selected: usize,
+    scroll_offset: usize,
+
     viewport_height: usize,
     list_area_y: u16,
     list_area_height: u16,
-    loaded_nodes: HashMap<String, Arc<LazyTreeNode>>,
-    all_paths: Vec<String>,
-    expanded_paths: HashSet<String>,
-    cached_tree_items: Option<Vec<ListItem<'static>>>,
-    last_scroll: usize,
-    last_expanded_hash: u64,
 }
 
 impl App {
     fn new(path: &Path) -> Result<Self, std::io::Error> {
-        let root_node = match build_tree(path) {
-            Ok(tree) => {
-                Some(Arc::new(LazyTreeNode::from_tree_node(tree)))
-            }
-            Err(e) => {
-                eprintln!("Error building tree: {}", e);
-                None
-            }
-        };
+        let flat = build_file_node(path, TraversalMode::Parallel, false)?;
+        let tree = to_tree(&flat);
 
-        let all_paths = if let Some(ref root_node) = root_node {
-            let mut paths = Vec::new();
-            Self::collect_all_paths(&root_node, &mut paths);
-            paths
-        } else {
-            Vec::new()
-        };
-
-        let mut loaded_nodes = HashMap::new();
-        if let Some(ref root_node) = root_node {
-            loaded_nodes.insert(root_node.path.clone(), root_node.clone());
-        }
-
-        Ok(Self {
-            root_node,
-            scroll: 0,
+        let mut app = Self {
+            flat,
+            tree,
+            mode: ViewMode::Tree,
+            expanded: HashSet::new(),
+            display_items: Vec::new(),
+            dirty: true,
+            selected: 0,
+            scroll_offset: 0,
             viewport_height: 24,
             list_area_y: 0,
             list_area_height: 0,
-            loaded_nodes,
-            all_paths,
-            expanded_paths: HashSet::new(),
-            cached_tree_items: None,
-            last_scroll: 0,
-            last_expanded_hash: 0,
-        })
+        };
+        app.ensure_display_items();
+        Ok(app)
     }
 
-    fn collect_all_paths(node: &LazyTreeNode, paths: &mut Vec<String>) {
-        paths.push(node.path.clone());
-        for child in &node.children {
-            Self::collect_all_paths(child, paths);
-        }
-    }
+    // --- Construction de la liste affichée ------------------------------
 
-    fn get_visible_tree_items(&self) -> Vec<(Arc<LazyTreeNode>, usize)> {
-        let mut visible_items = Vec::new();
-        if let Some(ref root_node) = self.root_node {
-            let mut stack = VecDeque::new();
-            stack.push_back((root_node.clone(), 0));
-
-            while let Some((node, depth)) = stack.pop_front() {
-                let loaded_node = if self.loaded_nodes.contains_key(&node.path) {
-                    self.loaded_nodes[&node.path].clone()
-                } else {
-                    node
-                };
-
-                visible_items.push((loaded_node.clone(), depth));
-
-                if self.expanded_paths.contains(&loaded_node.path) {
-                    for child in &loaded_node.children {
-                        stack.push_back((child.clone(), depth + 1));
-                    }
-                }
-            }
-        }
-        visible_items
-    }
-
-    fn load_node_if_needed(&mut self, path: &str) {
-        if !self.loaded_nodes.contains_key(path) {
-            let path_obj = Path::new(path);
-            if let Ok(tree) = build_tree(path_obj) {
-                let new_node = Arc::new(LazyTreeNode::from_tree_node(tree));
-                self.loaded_nodes.insert(path.to_string(), new_node);
-            }
-        }
-    }
-
-    fn ensure_visible_nodes_loaded(&mut self) {
-        if self.scroll % 3 != 0 && self.scroll != 0 {
+    fn ensure_display_items(&mut self) {
+        if !self.dirty {
             return;
         }
 
-        let visible_items = self.get_visible_tree_items();
-        for (node, _) in visible_items {
-            self.load_node_if_needed(&node.path);
-        }
+        // On retient le chemin sélectionné pour tenter de le retrouver après
+        // reconstruction (expand/collapse ou changement de mode).
+        let previously_selected_path = self
+            .display_items
+            .get(self.selected)
+            .map(|item| item.path.clone());
+
+        self.display_items = match self.mode {
+            ViewMode::Flat => self.build_flat_display_items(),
+            ViewMode::Tree => {
+                let mut items = Vec::new();
+                Self::push_tree_display_items(&self.tree.nodes, &self.expanded, &mut items);
+                items
+            }
+        };
+        self.dirty = false;
+
+        // On retrouve la même sélection si possible, sinon on borne l'index.
+        self.selected = previously_selected_path
+            .and_then(|path| self.display_items.iter().position(|item| item.path == path))
+            .unwrap_or(self.selected)
+            .min(self.display_items.len().saturating_sub(1));
+
+        self.ensure_selected_visible();
     }
 
-    fn toggle_expand(&mut self, node_path: &str) {
-        if self.expanded_paths.contains(node_path) {
-            self.expanded_paths.remove(node_path);
-        } else {
-            self.expanded_paths.insert(node_path.to_string());
-        }
-        self.cached_tree_items = None;
-    }
-
-    fn get_expanded_hash(&self) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        for path in &self.expanded_paths {
-            path.hash(&mut hasher);
-        }
-        hasher.finish()
-    }
-
-    fn get_items(&mut self) -> Vec<ListItem<'static>> {
-        self.get_tree_items()
-    }
-
-    fn get_tree_items(&mut self) -> Vec<ListItem<'static>> {
-        let current_hash = self.get_expanded_hash();
-        if self.last_scroll == self.scroll && self.last_expanded_hash == current_hash {
-            return self.cached_tree_items.clone().unwrap_or_default();
-        }
-
-        let visible_items = self.get_visible_tree_items();
-        let mut items = Vec::new();
-
-        for (node, depth) in visible_items {
-            let indent = "  ".repeat(depth);
-            let prefix = if node.is_directory {
-                if self.expanded_paths.contains(&node.path) {
-                    "📂 "
-                } else {
-                    "📁 "
-                }
-            } else {
-                "📄 "
-            };
-
-            let content = format!("{}{}{}", indent, prefix, node.name);
-            let style = if node.is_directory {
-                Style::default().fg(Color::Blue)
-            } else {
-                Style::default().fg(Color::Green)
-            };
-
-            items.push(ListItem::new(Line::from(Span::styled(content, style))));
-        }
-
-        self.cached_tree_items = Some(items.clone());
-        self.last_scroll = self.scroll;
-        self.last_expanded_hash = current_hash;
-
+    fn build_flat_display_items(&self) -> Vec<DisplayItem> {
+        let mut items: Vec<DisplayItem> = self
+            .flat
+            .nodes
+            .iter()
+            .map(|node| DisplayItem {
+                name: node.name.clone(),
+                path: node.path.clone(),
+                is_directory: node.is_directory,
+                depth: node.depth,
+            })
+            .collect();
+        items.sort_by(|a, b| a.path.cmp(&b.path));
         items
     }
 
-    fn get_info_text(&self) -> Text<'_> {
+    fn push_tree_display_items(nodes: &[FileNode], expanded: &HashSet<String>, out: &mut Vec<DisplayItem>) {
+        for node in nodes {
+            out.push(DisplayItem {
+                name: node.name.clone(),
+                path: node.path.clone(),
+                is_directory: node.is_directory,
+                depth: node.depth,
+            });
+
+            if node.is_directory && expanded.contains(&node.path) {
+                Self::push_tree_display_items(&node.children, expanded, out);
+            }
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    // --- Actions ----------------------------------------------------------
+
+    fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            ViewMode::Flat => ViewMode::Tree,
+            ViewMode::Tree => ViewMode::Flat,
+        };
+        self.mark_dirty();
+    }
+
+    fn toggle_expand_at(&mut self, index: usize) {
+        if self.mode != ViewMode::Tree {
+            return;
+        }
+        if let Some(item) = self.display_items.get(index) {
+            if !item.is_directory {
+                return;
+            }
+            if self.expanded.contains(&item.path) {
+                self.expanded.remove(&item.path);
+            } else {
+                self.expanded.insert(item.path.clone());
+            }
+            self.mark_dirty();
+        }
+    }
+
+    fn expand_selected(&mut self) {
+        if self.mode != ViewMode::Tree {
+            return;
+        }
+        if let Some(item) = self.display_items.get(self.selected) {
+            if item.is_directory && !self.expanded.contains(&item.path) {
+                self.expanded.insert(item.path.clone());
+                self.mark_dirty();
+            }
+        }
+    }
+
+    fn collapse_selected(&mut self) {
+        if self.mode != ViewMode::Tree {
+            return;
+        }
+        if let Some(item) = self.display_items.get(self.selected) {
+            if item.is_directory && self.expanded.contains(&item.path) {
+                self.expanded.remove(&item.path);
+                self.mark_dirty();
+            }
+        }
+    }
+
+    // --- Navigation ---------------------------------------------------------
+
+    fn move_down(&mut self) {
+        if self.selected + 1 < self.display_items.len() {
+            self.selected += 1;
+            self.ensure_selected_visible();
+        }
+    }
+
+    fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+        self.ensure_selected_visible();
+    }
+
+    fn page_down(&mut self) {
+        let step = self.viewport_height.max(1);
+        self.selected = (self.selected + step).min(self.display_items.len().saturating_sub(1));
+        self.ensure_selected_visible();
+    }
+
+    fn page_up(&mut self) {
+        let step = self.viewport_height.max(1);
+        self.selected = self.selected.saturating_sub(step);
+        self.ensure_selected_visible();
+    }
+
+    fn go_to_start(&mut self) {
+        self.selected = 0;
+        self.ensure_selected_visible();
+    }
+
+    fn go_to_end(&mut self) {
+        self.selected = self.display_items.len().saturating_sub(1);
+        self.ensure_selected_visible();
+    }
+
+    fn scroll_by(&mut self, delta: isize) {
+        let max_offset = self.display_items.len().saturating_sub(self.viewport_height.max(1));
+        let new_offset = (self.scroll_offset as isize + delta).max(0) as usize;
+        self.scroll_offset = new_offset.min(max_offset);
+    }
+
+    fn clamp_scroll(&mut self) {
+        let max_offset = self.display_items.len().saturating_sub(self.viewport_height.max(1));
+        self.scroll_offset = self.scroll_offset.min(max_offset);
+    }
+
+    /// Recale la vue pour que la sélection soit visible. À appeler
+    /// uniquement après un déplacement de sélection (clavier/clic/reconstruction
+    /// de la liste) — jamais à chaque frame, sinon ça annule un scroll molette
+    /// qui n'a pas déplacé la sélection.
+    fn ensure_selected_visible(&mut self) {
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.viewport_height > 0 && self.selected >= self.scroll_offset + self.viewport_height {
+            self.scroll_offset = self.selected + 1 - self.viewport_height;
+        }
+    }
+
+    fn handle_click(&mut self, row: u16) {
+        if row < self.list_area_y || row >= self.list_area_y + self.list_area_height {
+            return;
+        }
+        let index = self.scroll_offset + (row - self.list_area_y -1) as usize;
+        if index >= self.display_items.len() {
+            return;
+        }
+        self.selected = index;
+        self.toggle_expand_at(index);
+    }
+
+    // --- Rendu ---------------------------------------------------------------
+
+    /// Ne construit des `ListItem` que pour la tranche visible : le coût par
+    /// frame est proportionnel à `viewport_height`, jamais au nombre total
+    /// de fichiers/dossiers.
+    fn visible_list_items(&self) -> Vec<ListItem<'static>> {
+        let end = (self.scroll_offset + self.viewport_height).min(self.display_items.len());
+        self.display_items[self.scroll_offset..end]
+            .iter()
+            .map(|item| self.render_item(item))
+            .collect()
+    }
+
+    fn render_item(&self, item: &DisplayItem) -> ListItem<'static> {
+        let (prefix, style) = if item.is_directory {
+            let icon = if self.mode == ViewMode::Tree && self.expanded.contains(&item.path) {
+                "📂 "
+            } else {
+                "📁 "
+            };
+            (icon, Style::default().fg(Color::Blue))
+        } else {
+            ("📄 ", Style::default().fg(Color::Green))
+        };
+
+        let content = match self.mode {
+            ViewMode::Tree => {
+                let indent = "  ".repeat(item.depth.saturating_sub(1));
+                format!("{}{}{}", indent, prefix, item.name)
+            }
+            ViewMode::Flat => format!("{}{}", prefix, item.path),
+        };
+
+        ListItem::new(Line::from(Span::styled(content, style)))
+    }
+
+    fn info_text(&self) -> Text<'static> {
         let mut lines = Vec::new();
 
         lines.push(Line::from("Contrôles:".bold()));
-        lines.push(Line::from("  Q/Clic droit: Quitter"));
-        lines.push(Line::from("  ↑/↓: Naviguer"));
-        lines.push(Line::from("  PageUp/PageDown: Scroll rapide"));
-        lines.push(Line::from("  Entrée/Clic gauche: Déplier/Replier"));
+        lines.push(Line::from(
+            "  Q/Esc: Quitter   Tab: Flat/Tree   ↑/↓: Naviguer   PgUp/PgDn: Scroll rapide",
+        ));
+        lines.push(Line::from(
+            "  →/Entrée: Déplier   ←: Replier   Clic gauche: Sélection/Déplier   Molette: Scroll",
+        ));
         lines.push(Line::from(""));
 
-        lines.push(Line::from("Mode: Arborescent".fg(Color::Yellow)));
-        if let Some(root) = &self.root_node {
-            let total_files = Self::count_files_in_lazy(root);
-            let total_dirs = Self::count_dirs_in_lazy(root);
-            let loaded_count = self.loaded_nodes.len();
-            lines.push(Line::from(format!("Total: {} dossiers, {} fichiers", total_dirs, total_files)));
-            lines.push(Line::from(format!("Chargés: {}/{} nœuds", loaded_count, self.all_paths.len())));
-        }
+        lines.push(Line::from(format!("Mode: {}", self.mode.label()).fg(Color::Yellow)));
+        lines.push(Line::from(format!(
+            "Total: {} dossiers, {} fichiers",
+            self.tree.dirs_nb, self.tree.files_nb
+        )));
+        lines.push(Line::from(format!(
+            "Affichés: {} nœuds ({}/{})",
+            self.display_items.len(),
+            (self.selected + 1).min(self.display_items.len()),
+            self.display_items.len().max(1)
+        )));
 
         Text::from(lines)
-    }
-
-    fn count_files_in_lazy(node: &LazyTreeNode) -> usize {
-        let mut count = if !node.is_directory { 1 } else { 0 };
-        for child in &node.children {
-            count += Self::count_files_in_lazy(child);
-        }
-        count
-    }
-
-    fn count_dirs_in_lazy(node: &LazyTreeNode) -> usize {
-        let mut count = if node.is_directory { 1 } else { 0 };
-        for child in &node.children {
-            count += Self::count_dirs_in_lazy(child);
-        }
-        count
-    }
-
-    fn handle_click(&mut self, row: u16, _column: u16) {
-        if row >= self.list_area_y && row < self.list_area_y + self.list_area_height {
-            let relative_row = (row - self.list_area_y) as usize;
-            let index = relative_row + self.scroll;
-            let visible_items = self.get_visible_tree_items();
-            if index < visible_items.len() {
-                let node = &visible_items[index].0;
-                if node.is_directory {
-                    self.load_node_if_needed(&node.path);
-                    self.toggle_expand(&node.path);
-                }
-            }
-        }
     }
 }
 
 fn run_app(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(path)?;
 
+    let result = event_loop(&mut terminal, &mut app);
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+
+    result
+}
+
+fn event_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        terminal.draw(|f| {
-            let size = f.area();
-            app.viewport_height = size.height as usize;
-            ui(f, &mut app)
-        })?;
+        app.ensure_display_items();
 
-        app.ensure_visible_nodes_loaded();
+        terminal.draw(|f| ui(f, app))?;
 
-        // let root_node = match build_tree(path) {
-        //     Ok(tree) => {
-        //         Some(Arc::new(LazyTreeNode::from_tree_node(tree)))
-        //     }
-        //     Err(e) => {
-        //         eprintln!("Error building tree: {}", e);
-        //         None
-        //     }
-        // };
-        if event::poll(std::time::Duration::from_millis(16))? {
+        if event::poll(Duration::from_millis(16))? {
             match event::read()? {
-                // Event::FocusGained => null,
-                // Event::FocusLost => null,
                 Event::Key(key_event) => {
                     if key_event.kind == KeyEventKind::Press {
                         match key_event.code {
-                            KeyCode::Esc => break,
-                            KeyCode::Down => {
-                                let items_count = app.get_items().len();
-                                if app.scroll < items_count.saturating_sub(1) {
-                                    app.scroll += 1;
-                                }
-                            }
-                            KeyCode::Up => {
-                                if app.scroll > 0 {
-                                    app.scroll -= 1;
-                                }
-                            }
-                            KeyCode::PageDown => {
-                                let items_count = app.get_items().len();
-                                app.scroll = std::cmp::min(app.scroll + app.viewport_height / 2, items_count.saturating_sub(1));
-                                app.ensure_visible_nodes_loaded();
-                            }
-                            KeyCode::PageUp => {
-                                app.scroll = app.scroll.saturating_sub(app.viewport_height / 2);
-                            }
+                            KeyCode::Esc | KeyCode::Char('q') => break,
+                            KeyCode::Tab => app.toggle_mode(),
+                            KeyCode::Down => app.move_down(),
+                            KeyCode::Up => app.move_up(),
+                            KeyCode::PageDown => app.page_down(),
+                            KeyCode::PageUp => app.page_up(),
+                            KeyCode::Home => app.go_to_start(),
+                            KeyCode::End => app.go_to_end(),
+                            KeyCode::Right => app.expand_selected(),
+                            KeyCode::Left => app.collapse_selected(),
                             KeyCode::Enter => {
-                                let visible_items = app.get_visible_tree_items();
-                                if app.scroll < visible_items.len() {
-                                    let node = &visible_items[app.scroll].0;
-                                    if node.is_directory {
-                                        app.load_node_if_needed(&node.path);
-                                        app.toggle_expand(&node.path);
-                                    }
-                                }
+                                let selected = app.selected;
+                                app.toggle_expand_at(selected);
                             }
                             _ => {}
                         }
                     }
-                },
-                Event::Mouse(mouse_event) => {
-                    match mouse_event.kind {
-                        MouseEventKind::Down(button) => {
-                            match button {
-                                MouseButton::Left => {
-                                    app.handle_click(mouse_event.row, mouse_event.column);
-                                }
-                                MouseButton::Right => {
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        MouseEventKind::ScrollUp => {
-                            if app.scroll > 0 {
-                                app.scroll = app.scroll.saturating_sub(3);
-                            }
-                        }
-                        MouseEventKind::ScrollDown => {
-                            let items_count = app.get_items().len();
-                            if app.scroll < items_count.saturating_sub(1) {
-                                app.scroll = std::cmp::min(app.scroll + 3, items_count.saturating_sub(1));
-                                app.ensure_visible_nodes_loaded();
-                            }
-                        }
-                        _ => {}
+                }
+                Event::Mouse(mouse_event) => match mouse_event.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        app.handle_click(mouse_event.row);
                     }
+                    MouseEventKind::Down(MouseButton::Right) => break,
+                    MouseEventKind::ScrollUp => app.scroll_by(-3),
+                    MouseEventKind::ScrollDown => app.scroll_by(3),
+                    _ => {}
                 },
-                // Event::Paste(data) => null,
-                // Event::Resize(width, height) => null,
                 _ => {}
             }
         }
     }
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
     Ok(())
 }
@@ -375,43 +409,49 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
     let area = f.area();
 
     let block = Block::default()
-        .title(" File Tree Visualizer ".bold())
+        .title(" File Node Visualizer ".bold())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::White));
-
     f.render_widget(block, area);
 
     let inner = Rect {
-        x: 1,
-        y: 1,
+        x: area.x + 1,
+        y: area.y + 1,
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(7),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(7)])
         .split(inner);
 
-    app.list_area_y = inner.y + layout[0].y;
+    app.list_area_y = layout[0].y;
     app.list_area_height = layout[0].height;
+    app.viewport_height = layout[0].height as usize;
+    app.clamp_scroll();
 
+    let list_title = format!(
+        " {} ({}/{}) ",
+        app.mode.label(),
+        (app.selected + 1).min(app.display_items.len().max(1)),
+        app.display_items.len()
+    );
     let list_block = Block::default()
-        .title(" Mode Arborescent (clic pour déployer) ".bold())
+        .title(list_title.bold())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let items = app.get_items();
+    let items = app.visible_list_items();
     let list = List::new(items)
         .block(list_block)
         .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::Black))
         .highlight_symbol("> ");
 
-    let mut list_state = ratatui::widgets::ListState::default();
-    list_state.select(Some(app.scroll));
+    let mut list_state = ListState::default();
+    let selected_is_visible =
+        app.selected >= app.scroll_offset && app.selected < app.scroll_offset + app.viewport_height;
+    list_state.select(selected_is_visible.then(|| app.selected - app.scroll_offset));
     f.render_stateful_widget(list, layout[0], &mut list_state);
 
     let info_block = Block::default()
@@ -419,7 +459,7 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta));
 
-    let info_paragraph = Paragraph::new(app.get_info_text())
+    let info_paragraph = Paragraph::new(app.info_text())
         .block(info_block)
         .wrap(Wrap::default());
 
@@ -433,16 +473,17 @@ fn print_usage() {
     println!("  PATH  Directory path to visualize (default: current directory)");
     println!();
     println!("Controls:");
-    println!("  Q/Right click: Quit");
-    println!("  ↑/↓: Navigate (PageUp/PageDown for fast scroll)");
-    println!("  ENTER/Left click: Expand/Collapse nodes");
-    println!("  Mouse Wheel: Fast scrolling");
+    println!("  Q/Esc: Quit                Tab: Switch Flat/Tree mode");
+    println!("  Up/Down: Navigate          PageUp/PageDown: Fast scroll");
+    println!("  Right/Enter: Expand        Left: Collapse");
+    println!("  Left click: Select/Toggle  Right click: Quit");
+    println!("  Mouse wheel: Scroll view");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
         return Ok(());
     }

@@ -19,6 +19,6 @@ path = "tests/integration_tests.rs"
 name = "file_tree_json"
 path = "src/main.rs"
 
-#[[bin]]
-#name = "file_tree_tui"
-#path = "src/tui.rs"
+[[bin]]
+name = "file_tree_tui"
+path = "src/tui.rs"

@@ -1,4 +1,4 @@
-use file_tree_json::{build_tree, TraversalMode};
+use file_tree_json::{build_file_node, to_tree, TraversalMode};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -70,37 +70,47 @@ fn main() {
     };
 
     let start = Instant::now();
-    let tree = build_tree(Path::new(path), TraversalMode::Parallel, force_canonical).unwrap();
-    eprintln!("DEBUG: build_tree took {:?} - {} files, {} directories", start.elapsed(), tree.files_nb, tree.dirs_nb);
+    // build_file_node renvoie toujours un résultat à plat.
+    let flat = match build_file_node(Path::new(path), TraversalMode::Parallel, force_canonical) {
+        Ok(flat) => flat,
+        Err(e) => {
+            eprintln!("Erreur lors du parcours de '{}': {}", path, e);
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "DEBUG: build_file_node took {:?} - {} files, {} directories",
+        start.elapsed(),
+        flat.files_nb,
+        flat.dirs_nb
+    );
 
     let json_result = match mode {
-        // "flat" => {
-        //     let start_flat = Instant::now();
-        //     // let flat_nodes = tree_to_flat(&tree);
-        //     // eprintln!("DEBUG: tree_to_flat took {:?} for {} nodes", start_flat.elapsed(), flat_nodes.len());
-        //     eprintln!("DEBUG: tree_to_flat took {:?} for {} nodes", start_flat.elapsed(), flat_nodes.len());
-
-        //     // serde_json::to_string_pretty(&flat_nodes)
-        // }
-        "tree" | _ => {
+        "flat" => serde_json::to_string_pretty(&flat),
+        _ => {
+            let start_tree = Instant::now();
+            let tree = to_tree(&flat);
+            eprintln!(
+                "DEBUG: to_tree took {:?} for {} top-level nodes",
+                start_tree.elapsed(),
+                tree.nodes.len()
+            );
             serde_json::to_string_pretty(&tree)
         }
     };
 
     match json_result {
-        Ok(json) => {
-            match output_file {
-                Some(file_path) => {
-                    if let Err(e) = File::create(&file_path).and_then(|mut f| f.write_all(json.as_bytes())) {
-                        eprintln!("Erreur: impossible d'écrire dans le fichier {}: {}", file_path, e);
-                        std::process::exit(1);
-                    }
-                }
-                None => {
-                    println!("{}", json);
+        Ok(json) => match output_file {
+            Some(file_path) => {
+                if let Err(e) = File::create(&file_path).and_then(|mut f| f.write_all(json.as_bytes())) {
+                    eprintln!("Erreur: impossible d'écrire dans le fichier {}: {}", file_path, e);
+                    std::process::exit(1);
                 }
             }
-        }
+            None => {
+                println!("{}", json);
+            }
+        },
         Err(e) => {
             eprintln!("Erreur: {}", e);
             std::process::exit(1);
