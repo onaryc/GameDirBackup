@@ -519,22 +519,33 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
     f.render_stateful_widget(list, layout[0], &mut list_state);
 
     // Scrollbar verticale, affichée sur la bordure droite du bloc liste.
-    let mut v_scrollbar_state =
-        ScrollbarState::new(app.display_items.len()).position(app.scroll_offset);
+    // `viewport_content_length` est fixé explicitement à la hauteur réelle
+    // de la zone visible (sans les bordures) : sans ça, ratatui la déduit du
+    // Rect complet passé au rendu (bordures comprises), ce qui fausse à la
+    // fois la taille du curseur et sa correspondance avec la vue réelle.
+    let mut v_scrollbar_state = ScrollbarState::new(app.display_items.len())
+        .position(app.scroll_offset)
+        .viewport_content_length(app.viewport_height);
     let v_scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(None)
         .end_symbol(None)
         .style(Style::default().fg(Color::Cyan));
     f.render_stateful_widget(v_scrollbar, layout[0], &mut v_scrollbar_state);
 
-    // Scrollbar horizontale, affichée sur la bordure basse du bloc liste.
-    let mut h_scrollbar_state =
-        ScrollbarState::new(app.max_line_width).position(app.horizontal_offset);
-    let h_scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
-        .begin_symbol(None)
-        .end_symbol(None)
-        .style(Style::default().fg(Color::Cyan));
-    f.render_stateful_widget(h_scrollbar, layout[0], &mut h_scrollbar_state);
+    // Scrollbar horizontale : seulement si le contenu dépasse réellement la
+    // largeur visible. Sinon un curseur "plein" occuperait toute la barre
+    // (rien à faire défiler), ce qui donnait l'impression d'une barre bien
+    // plus grosse que la verticale.
+    if app.max_line_width > app.viewport_width {
+        let mut h_scrollbar_state = ScrollbarState::new(app.max_line_width)
+            .position(app.horizontal_offset)
+            .viewport_content_length(app.viewport_width);
+        let h_scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .style(Style::default().fg(Color::Cyan));
+        f.render_stateful_widget(h_scrollbar, layout[0], &mut h_scrollbar_state);
+    }
 
     let info_block = Block::default()
         .title(" Informations ".bold())
